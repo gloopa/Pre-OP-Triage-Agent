@@ -10,11 +10,15 @@ from pydantic import ValidationError
 
 from core import (
     BASELINE_SYSTEM_PROMPT,
+    EvidenceItem,
+    Finding,
     PatientSubmission,
+    TriageIssue,
     TriageOutput,
     triage_output_json_schema,
     triage_submission,
 )
+from run_evals import ScoredOutput
 
 
 @pytest.fixture
@@ -140,3 +144,103 @@ def test_triage_submission_rejects_invalid_model_json(
         triage_submission(submission_payload, model="test-model")
 
     assert openai_client.responses.create.call_count == 1
+
+
+# -------------------------
+# Output schema
+# -------------------------
+
+
+def _new_style_output() -> TriageOutput:
+    cbc_evidence = EvidenceItem(source="structured", path="labs[0]", value="CBC 2026-01-01")
+    temp_evidence = EvidenceItem(
+        source="document",
+        doc_id="doc-1",
+        doc_type="Pre-op Nursing Intake",
+        doc_date="2026-01-30",
+        quote="Temp 38.6 C",
+        value="38.6 C",
+    )
+    findings = [
+        Finding(
+            rule="TESTING",
+            check="CBC",
+            status="FAIL",
+            category="REQUIRED_TESTING",
+            summary="Latest CBC is 31 days before the procedure.",
+            evidence=[cbc_evidence],
+        ),
+        Finding(
+            rule="SAFETY",
+            check="TEMPERATURE",
+            status="FAIL",
+            category="ACUTE_SAFETY_EXCLUSION",
+            summary="Latest temperature 101.5 F exceeds 100.4 F.",
+            evidence=[temp_evidence],
+        ),
+        Finding(rule="SAFETY", check="BP", status="PASS", summary="Latest BP 120/80."),
+    ]
+    issues = [
+        TriageIssue(
+            category=f.category,
+            evidence=f.evidence,
+            rule=f.rule,
+            check=f.check,
+            status=f.status,
+            summary=f.summary,
+        )
+        for f in findings
+        if f.status != "PASS" and f.category is not None
+    ]
+    return TriageOutput(
+        decision="NOT_CLEARED",
+        issues=issues,
+        explanation="Fever exclusion; CBC out of window.",
+        findings=findings,
+    )
+
+
+def test_new_style_output_validates_against_scorer() -> None:
+    output = _new_style_output()
+
+    scored = ScoredOutput.model_validate(output.model_dump())
+
+    assert scored.decision == "NOT_CLEARED"
+    assert sorted(issue.category for issue in scored.issues) == [
+        "ACUTE_SAFETY_EXCLUSION",
+        "REQUIRED_TESTING",
+    ]
+
+
+def test_new_style_output_round_trips_through_json() -> None:
+    output = _new_style_output()
+
+    restored = TriageOutput.model_validate_json(output.model_dump_json())
+
+    assert restored == output
+    assert isinstance(restored.issues[0].evidence, list)
+    assert restored.issues[1].evidence[0].quote == "Temp 38.6 C"
+    assert len(restored.findings) == 3
+
+
+def test_baseline_style_output_still_validates() -> None:
+    output = TriageOutput.model_validate(
+        {
+            "decision": "NEEDS_FOLLOW_UP",
+            "issues": [{"category": "REQUIRED_DOCUMENTATION", "evidence": "No consent."}],
+            "explanation": "Consent missing.",
+        }
+    )
+
+    assert output.issues[0].evidence == "No consent."
+    assert output.findings == []
+
+
+def test_invalid_issue_category_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        TriageIssue.model_validate({"category": "SOMETHING_ELSE", "evidence": []})
+
+    with pytest.raises(ValidationError):
+        Finding.model_validate(
+            {"rule": "SAFETY", "check": "BP", "status": "FAIL", "category": "BAD", "summary": "x"}
+        )

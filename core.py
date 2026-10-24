@@ -155,10 +155,38 @@ class PatientSubmission(BaseModel):
     documents: list[Document] = Field(default_factory=list)
     metadata: SubmissionMetadata | None = None
 
+RuleName = Literal["DOCUMENTATION", "TESTING", "ANTICOAGULATION", "SAFETY"]
+CheckStatus = Literal["PASS", "FAIL", "UNKNOWN"]
+
+class EvidenceItem(BaseModel):
+    """One verifiable piece of evidence: a structured field path or a document quote."""
+
+    source: Literal["structured", "document"]
+    path: str | None = None
+    doc_id: str | None = None
+    doc_type: str | None = None
+    doc_date: str | None = None
+    quote: str | None = None
+    value: str | None = None
+
+class Finding(BaseModel):
+    """Result of one policy subcheck (e.g. H&P, CBC, BP), including PASS results."""
+
+    rule: RuleName
+    check: str
+    status: CheckStatus
+    category: IssueCategory | None = None
+    summary: str
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+
 class TriageIssue(BaseModel):
 
     category: IssueCategory
-    evidence: str
+    evidence: str | list[EvidenceItem]
+    rule: RuleName | None = None
+    check: str | None = None
+    status: Literal["FAIL", "UNKNOWN"] | None = None
+    summary: str | None = None
 
 class TriageOutput(BaseModel):
     """Structured output contract for triage responses."""
@@ -166,6 +194,7 @@ class TriageOutput(BaseModel):
     decision: Decision
     issues: list[TriageIssue] = Field(validation_alias=AliasChoices("issues"))
     explanation: str
+    findings: list[Finding] = Field(default_factory=list)
 
 
 def triage_output_json_schema() -> dict[str, object]:
