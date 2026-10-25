@@ -12,6 +12,7 @@ from extraction import (
     ExtractionResult,
     HistoryPhysical,
     Medication,
+    PlanPhase,
     Temperature,
     empty_extraction,
 )
@@ -197,7 +198,8 @@ def test_document_meds_and_plans_are_canonicalized() -> None:
         Medication(name="aspirin", status="CURRENT", as_of=None, evidence=Evidence(doc_id="note-1", quote="Temp"))
     )
     facts.anticoagulation_plans.append(
-        AnticoagulationPlan(medication="Xarelto", before_surgery=None, after_surgery=None,
+        AnticoagulationPlan(medication="Xarelto", before_surgery=PlanPhase(status="NOT_ADDRESSED", evidence=None),
+                            after_surgery=PlanPhase(status="NOT_ADDRESSED", evidence=None),
                             evidence=Evidence(doc_id="note-1", quote="Xarelto"))
     )
 
@@ -229,9 +231,63 @@ def test_extraction_failure_is_carried_into_bundle() -> None:
 
 
 def test_rejected_facts_are_carried_into_bundle() -> None:
-    rejected = [{"kind": "blood_pressures", "reason": "unknown doc_id", "fact": {"systolic": 190}}]
+    bp = {"systolic": 190, "diastolic": 100, "measured_at": "09:05",
+          "evidence": {"doc_id": "note-1", "quote": "BP 190/100"}}
+    rejected = [{"kind": "blood_pressures", "reason": "quote not found verbatim in document", "fact": bp}]
 
     bundle = build_evidence(_submission(), ExtractionResult(facts=empty_extraction(), rejected=rejected))
 
     assert bundle.rejected_facts == rejected
-    assert bundle.vitals[-1].evidence.source == "structured"  # The rejected BP was not merged.
+    assert all(v.evidence.source == "structured" for v in bundle.vitals)  # Not merged as valid evidence.
+    (typed,) = bundle.rejected.vitals
+    assert (typed.systolic, typed.at) == (190, datetime(2026, 3, 3, 9, 5))
+    assert typed.evidence.rejected_reason == "blood_pressures: quote not found verbatim in document"
+
+
+def test_rejected_plan_phase_brings_back_the_whole_plan() -> None:
+    plan = {
+        "medication": "Xarelto",
+        "before_surgery": {"status": "STATED", "evidence": {"doc_id": "note-1", "quote": "Hold Xarelto 3 days"}},
+        "after_surgery": {"status": "STATED",
+                          "evidence": {"doc_id": "note-1", "quote": "Currently taking Xarelto 20 mg."}},
+        "evidence": {"doc_id": "note-1", "quote": "Xarelto"},
+    }
+    rejected = [{"kind": "anticoagulation_plans.before_surgery", "reason": "quote not found verbatim in document",
+                 "fact": plan["before_surgery"]["evidence"], "plan": plan}]
+
+    bundle = build_evidence(_submission(), ExtractionResult(facts=empty_extraction(), rejected=rejected))
+
+    (typed,) = bundle.rejected.plans
+    assert typed.canonical == "rivaroxaban"
+    assert typed.before_surgery is not None and typed.after_surgery is not None
+
+
+def test_no_rejected_facts_means_no_rejected_bundle() -> None:
+    assert build_evidence(_submission(), _ok()).rejected is None
+
+
+def _plan_with(before: PlanPhase, after: PlanPhase):
+    facts = empty_extraction()
+    facts.anticoagulation_plans.append(
+        AnticoagulationPlan(medication="Xarelto", before_surgery=before, after_surgery=after,
+                            evidence=Evidence(doc_id="note-1", quote="Xarelto"))
+    )
+    return build_evidence(_submission(), _ok(facts)).plans[0]
+
+
+def test_plan_phases_are_labelled_and_only_stated_counts() -> None:
+    stated = PlanPhase(status="STATED", evidence=Evidence(doc_id="note-1", quote="Currently taking Xarelto 20 mg."))
+    deferred = PlanPhase(status="DEFERRED", evidence=Evidence(doc_id="note-1", quote="Temp 38.6 C"))
+
+    plan = _plan_with(stated, deferred)
+
+    assert plan.evidence.value == "plan for Xarelto"
+    assert plan.before_surgery.value == "before surgery: STATED"
+    assert plan.after_surgery is None  # Deferred is not an instruction.
+    assert [e.value for e in plan.other_evidence] == ["after surgery: DEFERRED"]
+
+
+def test_stated_phase_without_a_quote_is_not_an_instruction() -> None:
+    plan = _plan_with(PlanPhase(status="STATED", evidence=None), PlanPhase(status="NOT_ADDRESSED", evidence=None))
+
+    assert (plan.before_surgery, plan.after_surgery, plan.other_evidence) == (None, None, [])

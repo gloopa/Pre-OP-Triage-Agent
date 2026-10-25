@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import cache
 import json
+import re
 from typing import Literal
 
 import openai
@@ -68,10 +69,19 @@ class Medication(BaseModel):
     evidence: Evidence
 
 
+class PlanPhase(BaseModel):
+    """One phase of a plan. The model must choose a status, so a phase is never silently skipped."""
+
+    # STATED: the text gives the instruction (quote it). DEFERRED: the text hands it to someone
+    # else or says it will be decided later (quote that). NOT_ADDRESSED: the text says nothing.
+    status: Literal["STATED", "DEFERRED", "NOT_ADDRESSED"]
+    evidence: Evidence | None
+
+
 class AnticoagulationPlan(BaseModel):
     medication: str | None  # Matched to current anticoagulants via the Python alias map.
-    before_surgery: Evidence | None
-    after_surgery: Evidence | None
+    before_surgery: PlanPhase
+    after_surgery: PlanPhase
     evidence: Evidence
 
 
@@ -106,7 +116,10 @@ readiness, apply policy, or make any clearance decision.
 General rules:
 - Every fact needs evidence: the doc_id of the document it came from and a quote copied
   verbatim (exact characters, including punctuation and spacing) from that document's text.
+  Use the short doc_id exactly as given for each document (e.g. "D1").
   Keep quotes short but sufficient to support the fact.
+- Never skip, reorder, or paraphrase words inside a quote. If the supporting text is in
+  separate places, quote each part exactly and separate the parts with "...".
 - Extract only what the text states. Leave a nullable field null when the text does not
   support it. Never treat silence as a negative.
 - Do extract explicit statements that something is missing, pending, not done, or uncertain.
@@ -142,32 +155,65 @@ Medications (any medication mentioned, with its status as of that document):
 - as_of: the date the status statement applies to, if stated.
 
 Anticoagulation plans:
-- One entry per documented perioperative plan for a specific medication.
+- One entry per medication per document: put all of that document's instructions for the
+  medication in a single entry, never one entry per phase.
 - evidence: quote identifying the plan and the medication it covers.
-- before_surgery / after_surgery: quote the actual instruction for that phase (e.g. when to
-  stop, when to resume). Null if that phase is not addressed, deferred, or left to someone
-  else. Never infer a missing instruction or combine instructions from different medications.
+- before_surgery / after_surgery: choose a status for each phase, every time.
+  - STATED: the text gives the instruction for that phase (e.g. when to stop, when to resume).
+    evidence quotes it. The same sentence may be quoted for evidence, before_surgery and
+    after_surgery when one sentence covers them.
+  - DEFERRED: the text leaves that phase to someone else or to later (e.g. "to be determined
+    by the surgical team", "will be addressed after surgery"). evidence quotes that statement.
+  - NOT_ADDRESSED: the text says nothing about that phase. evidence is null.
+  Never infer a missing instruction or combine instructions from different medications.
 """.strip()
 
 
+def short_doc_ids(submission: PatientSubmission) -> dict[str, str | None]:
+    """Short prompt id ("D1", "D2", ...) -> real doc_id. Models miscopy long UUIDs."""
+
+    return {f"D{i}": doc.doc_id for i, doc in enumerate(submission.documents, start=1)}
+
+
 def build_prompt(submission: PatientSubmission) -> str:
-    """User input: the scheduled procedure plus every document with its metadata."""
+    """User input: the scheduled procedure plus every document (under its short id) with metadata."""
 
     procedure_type = submission.procedure.procedure_type if submission.procedure else None
     payload = {
         "scheduled_procedure": procedure_type,
         "documents": [
             {
-                "doc_id": doc.doc_id,
+                "doc_id": short_id,
                 "type": doc.type,
                 "date": doc.date,
                 "author": doc.author,
                 "text": doc.text,
             }
-            for doc in submission.documents
+            for short_id, doc in zip(short_doc_ids(submission), submission.documents)
         ],
     }
     return "Extract facts from these documents.\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _map_doc_ids(facts: PatientDocumentExtraction, ids: dict[str, str | None]) -> PatientDocumentExtraction:
+    """Replace short ids with real doc_ids. Anything else is left as is, so validation rejects it."""
+
+    def mapped(evidence: Evidence | None) -> Evidence | None:
+        if evidence is None or ids.get(evidence.doc_id) is None:
+            return evidence
+        return evidence.model_copy(update={"doc_id": ids[evidence.doc_id]})
+
+    kept: dict[str, list[BaseModel]] = {}
+    for name in PatientDocumentExtraction.model_fields:
+        kept[name] = []
+        for fact in getattr(facts, name):
+            update: dict[str, object] = {"evidence": mapped(fact.evidence)}
+            if isinstance(fact, AnticoagulationPlan):
+                for phase in ("before_surgery", "after_surgery"):
+                    plan_phase = getattr(fact, phase)
+                    update[phase] = plan_phase.model_copy(update={"evidence": mapped(plan_phase.evidence)})
+            kept[name].append(fact.model_copy(update=update))
+    return PatientDocumentExtraction(**kept)
 
 
 # -------------------------
@@ -185,11 +231,30 @@ class ExtractionResult:
     error: str | None = None
 
 
+# A degree sign before C/F, including the garbled form models emit for it ("\x17" + "6").
+_DEGREE = re.compile(r"(?:[°º�]|[\x00-\x08\x0b\x0c\x0e-\x1f]6?)(?=\s*[CF]\b)")
+_PIECE_BREAK = re.compile(r"\n|\.\.\.|…")
+
+
+def _clean(text: str) -> str:
+    """Drop degree signs (real or garbled) and collapse whitespace; nothing else changes."""
+
+    return re.sub(r"\s+", " ", _DEGREE.sub("", text)).strip()
+
+
+def quote_pieces(quote: str) -> list[str]:
+    """Split a quote at line breaks and ellipses into the pieces that must each match."""
+
+    return [piece for piece in (_clean(p) for p in _PIECE_BREAK.split(quote)) if piece]
+
+
 def _evidence_problem(evidence: Evidence, docs: dict[str, Document]) -> str | None:
     doc = docs.get(evidence.doc_id)
     if doc is None:
         return "unknown doc_id"
-    if not evidence.quote or evidence.quote not in (doc.text or ""):
+    text = _clean(doc.text or "")
+    pieces = quote_pieces(evidence.quote or "")
+    if not pieces or any(piece not in text for piece in pieces):
         return "quote not found verbatim in document"
     return None
 
@@ -211,9 +276,10 @@ def validate_extraction(
                 rejected.append({"kind": name, "reason": problem, "fact": fact.model_dump()})
                 continue
             if isinstance(fact, AnticoagulationPlan):
+                original = fact
                 fact = fact.model_copy()
                 for phase in ("before_surgery", "after_surgery"):
-                    phase_evidence = getattr(fact, phase)
+                    phase_evidence = getattr(fact, phase).evidence
                     if phase_evidence is None:
                         continue
                     phase_problem = _evidence_problem(phase_evidence, docs)
@@ -223,9 +289,12 @@ def validate_extraction(
                                 "kind": f"anticoagulation_plans.{phase}",
                                 "reason": phase_problem,
                                 "fact": phase_evidence.model_dump(),
+                                "plan": original.model_dump(),  # The plan as extracted, both phases.
                             }
                         )
-                        setattr(fact, phase, None)
+                        # Keep the model's status but drop the unverified quote; an unquoted
+                        # STATED phase does not count as an instruction.
+                        setattr(fact, phase, PlanPhase(status=getattr(fact, phase).status, evidence=None))
             kept[name].append(fact)
 
     return PatientDocumentExtraction(**kept), rejected
@@ -267,5 +336,6 @@ def extract_documents(submission: PatientSubmission, *, model: str) -> Extractio
         ]
         return _failure("refusal: " + " ".join(refusals) if refusals else "no parsed output")
 
-    facts, rejected = validate_extraction(parsed, submission.documents)
+    facts = _map_doc_ids(parsed, short_doc_ids(submission))
+    facts, rejected = validate_extraction(facts, submission.documents)
     return ExtractionResult(facts=facts, rejected=rejected)

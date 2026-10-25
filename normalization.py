@@ -15,7 +15,18 @@ from core import (
     ProcedureRisk,
     TemperatureVital,
 )
-from extraction import Evidence, ExtractionResult
+from extraction import (
+    AnticoagulationPlan,
+    BloodPressure,
+    Evidence,
+    ExtractionResult,
+    HistoryPhysical,
+    Medication,
+    PatientDocumentExtraction,
+    SurgicalConsent,
+    Temperature,
+    empty_extraction,
+)
 
 # -------------------------
 # Normalization
@@ -152,9 +163,11 @@ class ConsentFact:
 @dataclass
 class PlanFact:
     canonical: str | None
-    before_surgery: EvidenceItem | None
+    before_surgery: EvidenceItem | None  # Only a STATED phase with a verified quote.
     after_surgery: EvidenceItem | None
     evidence: EvidenceItem
+    # Quotes for DEFERRED phases (e.g. "to be determined by the surgical team"), for the reviewer.
+    other_evidence: list[EvidenceItem] = field(default_factory=list)
 
 
 @dataclass
@@ -173,6 +186,9 @@ class EvidenceBundle:
     extraction_error: str | None = None
     # LLM facts dropped by quote validation, kept so they never silently disappear.
     rejected_facts: list[dict[str, object]] = field(default_factory=list)
+    # The same rejected facts as typed evidence (marked rejected_reason), never used as valid
+    # evidence; the rules only use them to tell whether they could change a check.
+    rejected: EvidenceBundle | None = None
 
 
 # -------------------------
@@ -188,7 +204,9 @@ def _structured(path: str, value: str) -> EvidenceItem:
     return EvidenceItem(source="structured", path=path, value=value)
 
 
-def _document(evidence: Evidence, docs: dict[str, Document], value: str | None = None) -> EvidenceItem:
+def _document(
+    evidence: Evidence, docs: dict[str, Document], value: str | None = None, rejected_reason: str | None = None
+) -> EvidenceItem:
     doc = docs.get(evidence.doc_id)
     return EvidenceItem(
         source="document",
@@ -197,6 +215,7 @@ def _document(evidence: Evidence, docs: dict[str, Document], value: str | None =
         doc_date=doc.date if doc else None,
         quote=evidence.quote,
         value=value,
+        rejected_reason=rejected_reason,
     )
 
 
@@ -260,12 +279,98 @@ def _structured_meds(submission: PatientSubmission) -> list[MedStatement]:
     return meds
 
 
+def _doc_date(docs: dict[str, Document], doc_id: str) -> date | None:
+    doc = docs.get(doc_id)
+    return parse_date(doc.date if doc else None)
+
+
+def _add_document_facts(
+    bundle: EvidenceBundle,
+    facts: PatientDocumentExtraction,
+    docs: dict[str, Document],
+    rejected_reason: str | None = None,
+) -> None:
+    def ev(evidence: Evidence, value: str | None = None) -> EvidenceItem:
+        return _document(evidence, docs, value, rejected_reason)
+
+    for bp in facts.blood_pressures:
+        at, has_time, source = _document_time(bp.measured_at, docs.get(bp.evidence.doc_id))
+        value = f"{_fmt(bp.systolic)}/{_fmt(bp.diastolic)} mmHg"
+        bundle.vitals.append(
+            Vital("BP", at, has_time, source, ev(bp.evidence, value), systolic=bp.systolic, diastolic=bp.diastolic)
+        )
+    for temp in facts.temperatures:
+        at, has_time, source = _document_time(temp.measured_at, docs.get(temp.evidence.doc_id))
+        temp_f = to_f(temp.value, temp.unit)
+        value = f"{_fmt(temp.value)} {temp.unit}" + (f" ({temp_f:.1f} F)" if temp.unit == "C" else "")
+        bundle.vitals.append(Vital("TEMP", at, has_time, source, ev(temp.evidence, value), temp_f=temp_f))
+    for hp in facts.history_physicals:
+        at = parse_date(hp.date) or (_doc_date(docs, hp.evidence.doc_id) if hp.status == "COMPLETED" else None)
+        bundle.history_physicals.append(HistoryPhysicalFact(hp.status, at, ev(hp.evidence, f"{hp.status} {hp.date}")))
+    for consent in facts.surgical_consents:
+        value = f"{consent.status} by {consent.signer} for {consent.procedure}"
+        bundle.consents.append(
+            ConsentFact(
+                consent.status,
+                consent.signer,
+                consent.matches_scheduled_procedure,
+                parse_date(consent.signed_at),
+                ev(consent.evidence, value),
+            )
+        )
+    for med in facts.medications:
+        canonical = canonical_anticoagulant(med.name)
+        if canonical is None:
+            continue
+        as_of = parse_date(med.as_of) or _doc_date(docs, med.evidence.doc_id)
+        bundle.meds.append(MedStatement(canonical, med.status, as_of, ev(med.evidence, f"{med.name}: {med.status}")))
+    for plan in facts.anticoagulation_plans:
+        instructions: dict[str, EvidenceItem | None] = {}
+        other: list[EvidenceItem] = []
+        for phase, label in ((plan.before_surgery, "before surgery"), (plan.after_surgery, "after surgery")):
+            quote = ev(phase.evidence, f"{label}: {phase.status}") if phase.evidence else None
+            instructions[label] = quote if phase.status == "STATED" else None
+            if quote and phase.status != "STATED":
+                other.append(quote)
+        bundle.plans.append(
+            PlanFact(
+                canonical_anticoagulant(plan.medication),
+                instructions["before surgery"],
+                instructions["after surgery"],
+                ev(plan.evidence, f"plan for {plan.medication}"),
+                other,
+            )
+        )
+
+
+_FACT_MODELS = {
+    "blood_pressures": BloodPressure,
+    "temperatures": Temperature,
+    "history_physicals": HistoryPhysical,
+    "surgical_consents": SurgicalConsent,
+    "medications": Medication,
+    "anticoagulation_plans": AnticoagulationPlan,
+}
+
+
+def _rejected_as_facts(record: dict[str, object]) -> PatientDocumentExtraction:
+    """One rejected record back as an extraction. A rejected plan phase brings back the whole plan."""
+
+    facts = empty_extraction()
+    kind = str(record["kind"])
+    if kind.startswith("anticoagulation_plans."):
+        facts.anticoagulation_plans.append(AnticoagulationPlan.model_validate(record["plan"]))
+    else:
+        getattr(facts, kind).append(_FACT_MODELS[kind].model_validate(record["fact"]))
+    return facts
+
+
 def build_evidence(submission: PatientSubmission, extraction: ExtractionResult) -> EvidenceBundle:
     """Merge structured fields and validated document facts, keeping provenance."""
 
     procedure = submission.procedure
     docs = {doc.doc_id: doc for doc in submission.documents if doc.doc_id}
-    bundle = EvidenceBundle(
+    procedure_fields = dict(
         procedure_date=parse_date(procedure.procedure_date if procedure else None),
         procedure_risk=procedure.procedure_risk if procedure else None,
         procedure_type=procedure.procedure_type if procedure else None,
@@ -275,6 +380,9 @@ def build_evidence(submission: PatientSubmission, extraction: ExtractionResult) 
             f"date={procedure.procedure_date if procedure else None}; "
             f"risk={procedure.procedure_risk if procedure else None}",
         ),
+    )
+    bundle = EvidenceBundle(
+        **procedure_fields,
         vitals=_structured_vitals(submission),
         labs=_structured_labs(submission),
         meds=_structured_meds(submission),
@@ -282,55 +390,11 @@ def build_evidence(submission: PatientSubmission, extraction: ExtractionResult) 
         extraction_error=extraction.error,
         rejected_facts=list(extraction.rejected),
     )
+    _add_document_facts(bundle, extraction.facts, docs)
 
-    facts = extraction.facts
-    for bp in facts.blood_pressures:
-        at, has_time, source = _document_time(bp.measured_at, docs.get(bp.evidence.doc_id))
-        value = f"{_fmt(bp.systolic)}/{_fmt(bp.diastolic)} mmHg"
-        bundle.vitals.append(
-            Vital("BP", at, has_time, source, _document(bp.evidence, docs, value),
-                  systolic=bp.systolic, diastolic=bp.diastolic)
-        )
-    for temp in facts.temperatures:
-        at, has_time, source = _document_time(temp.measured_at, docs.get(temp.evidence.doc_id))
-        temp_f = to_f(temp.value, temp.unit)
-        value = f"{_fmt(temp.value)} {temp.unit}" + (f" ({temp_f:.1f} F)" if temp.unit == "C" else "")
-        bundle.vitals.append(
-            Vital("TEMP", at, has_time, source, _document(temp.evidence, docs, value), temp_f=temp_f)
-        )
-    for hp in facts.history_physicals:
-        at = parse_date(hp.date) or (
-            parse_date(docs[hp.evidence.doc_id].date) if hp.status == "COMPLETED" else None
-        )
-        bundle.history_physicals.append(
-            HistoryPhysicalFact(hp.status, at, _document(hp.evidence, docs, f"{hp.status} {hp.date}"))
-        )
-    for consent in facts.surgical_consents:
-        value = f"{consent.status} by {consent.signer} for {consent.procedure}"
-        bundle.consents.append(
-            ConsentFact(
-                consent.status,
-                consent.signer,
-                consent.matches_scheduled_procedure,
-                parse_date(consent.signed_at),
-                _document(consent.evidence, docs, value),
-            )
-        )
-    for med in facts.medications:
-        canonical = canonical_anticoagulant(med.name)
-        if canonical is None:
-            continue
-        as_of = parse_date(med.as_of) or parse_date(docs[med.evidence.doc_id].date)
-        bundle.meds.append(
-            MedStatement(canonical, med.status, as_of, _document(med.evidence, docs, f"{med.name}: {med.status}"))
-        )
-    for plan in facts.anticoagulation_plans:
-        bundle.plans.append(
-            PlanFact(
-                canonical_anticoagulant(plan.medication),
-                _document(plan.before_surgery, docs) if plan.before_surgery else None,
-                _document(plan.after_surgery, docs) if plan.after_surgery else None,
-                _document(plan.evidence, docs, plan.medication),
-            )
-        )
+    if extraction.rejected:
+        bundle.rejected = EvidenceBundle(**procedure_fields)
+        for record in extraction.rejected:
+            reason = f"{record['kind']}: {record['reason']}"
+            _add_document_facts(bundle.rejected, _rejected_as_facts(record), docs, reason)
     return bundle
