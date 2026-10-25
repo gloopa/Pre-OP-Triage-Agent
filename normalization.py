@@ -1,4 +1,4 @@
-"""Normalization and structured parsing: merge structured fields and document facts into one evidence bundle."""
+"""Turn structured fields and extracted document facts into one set of evidence for the rules."""
 
 from __future__ import annotations
 
@@ -28,12 +28,11 @@ from extraction import (
     empty_extraction,
 )
 
-# -------------------------
-# Normalization
-# -------------------------
+# Lookup tables and parsing helpers
 
-# Assumption (APPENDIX.md names no drugs): these are the anticoagulants, by generic and brand
-# name. Anything else, including antiplatelets such as aspirin and clopidogrel, is not one.
+# The policy doesn't name any drugs, so this list is an assumption: these generic and brand names
+# are anticoagulants. Anything else, including antiplatelets like aspirin and clopidogrel, is not.
+# A drug missing from this list is treated as not an anticoagulant.
 ANTICOAGULANTS: dict[str, tuple[str, ...]] = {
     "warfarin": ("warfarin", "coumadin"),
     "apixaban": ("apixaban", "eliquis"),
@@ -44,9 +43,10 @@ ANTICOAGULANTS: dict[str, tuple[str, ...]] = {
     "heparin": ("heparin",),
 }
 
+# Lab codes accepted as a CBC or CMP. Other codes are ignored, so the test counts as missing.
 LAB_ALIASES: dict[str, str] = {"CBC": "CBC", "LAB-CBC": "CBC", "CMP": "CMP", "LAB-CMP": "CMP"}
-# Completed result statuses (FHIR Observation); anything else (preliminary, registered,
-# cancelled, entered-in-error, unknown, missing) is not a valid result.
+# Lab statuses that count as a finished result. Anything else (preliminary, cancelled,
+# entered-in-error, missing, ...) is ignored.
 COMPLETED_LAB_STATUSES = frozenset({"final", "amended", "corrected"})
 
 _DATETIME_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M")
@@ -55,9 +55,9 @@ _TIME_OF_DAY = re.compile(r"^(\d{1,2}):(\d{2})\s*([AaPp][Mm])?$")
 
 
 def parse_when(value: str | None) -> tuple[datetime, bool] | None:
-    """Parse a date or date/time string; returns (naive datetime, has_time).
+    """Parse a date or date-time into (datetime, has_time), or None if it can't be read.
 
-    Timezones are dropped: all times are treated as the clinic's local time.
+    Time zones are dropped: every time is treated as the clinic's local time.
     """
 
     if not value:
@@ -83,6 +83,8 @@ def parse_date(value: str | None) -> date | None:
 
 
 def parse_time_of_day(value: str | None) -> time | None:
+    """Parse a time on its own, like "09:05" or "2:30 PM"."""
+
     match = _TIME_OF_DAY.match((value or "").strip())
     if not match:
         return None
@@ -97,12 +99,14 @@ def parse_time_of_day(value: str | None) -> time | None:
 
 
 def to_f(value: float, unit: Literal["C", "F"]) -> float:
-    """Fahrenheit, unrounded, so threshold comparisons stay exact."""
+    """Convert to Fahrenheit without rounding, so values right at the limit compare correctly."""
 
     return value * 9 / 5 + 32 if unit == "C" else value
 
 
 def canonical_anticoagulant(name: str | None) -> str | None:
+    """The generic name if `name` mentions a known anticoagulant, else None."""
+
     tokens = set(re.findall(r"[a-z]+", (name or "").lower()))
     for canonical, aliases in ANTICOAGULANTS.items():
         if tokens.intersection(aliases):
@@ -110,9 +114,7 @@ def canonical_anticoagulant(name: str | None) -> str | None:
     return None
 
 
-# -------------------------
-# Internal evidence model
-# -------------------------
+# Evidence types used by the rules
 
 
 @dataclass
@@ -120,6 +122,7 @@ class Vital:
     kind: Literal["BP", "TEMP"]
     at: datetime | None
     has_time: bool
+    # Where `at` came from: a structured field, the document text, the document's date, or nowhere.
     time_source: Literal["structured", "text", "text_date", "doc_date+text_time", "doc_date", "none"]
     evidence: EvidenceItem
     systolic: float | None = None
@@ -136,11 +139,11 @@ class Lab:
 
 @dataclass
 class MedStatement:
-    """A status statement about an anticoagulant, from the med list or a document."""
+    """One statement about an anticoagulant, from the medication list or a document."""
 
     canonical: str
     status: Literal["CURRENT", "STOPPED", "HISTORICAL", "PLANNED", "UNCERTAIN"]
-    as_of: date | None  # None for structured entries, which carry no date.
+    as_of: date | None  # None for medication-list entries, which have no date.
     evidence: EvidenceItem
 
 
@@ -163,10 +166,10 @@ class ConsentFact:
 @dataclass
 class PlanFact:
     canonical: str | None
-    before_surgery: EvidenceItem | None  # Only a STATED phase with a verified quote.
+    before_surgery: EvidenceItem | None  # Set only for a STATED phase with a verified quote.
     after_surgery: EvidenceItem | None
     evidence: EvidenceItem
-    # Quotes for DEFERRED phases (e.g. "to be determined by the surgical team"), for the reviewer.
+    # Quotes for DEFERRED phases: shown to the reviewer, never counted as an instruction.
     other_evidence: list[EvidenceItem] = field(default_factory=list)
 
 
@@ -184,16 +187,14 @@ class EvidenceBundle:
     plans: list[PlanFact] = field(default_factory=list)
     extraction_failed: bool = False
     extraction_error: str | None = None
-    # LLM facts dropped by quote validation, kept so they never silently disappear.
+    # Facts that failed the quote check, reported in the output so nothing disappears silently.
     rejected_facts: list[dict[str, object]] = field(default_factory=list)
-    # The same rejected facts as typed evidence (marked rejected_reason), never used as valid
-    # evidence; the rules only use them to tell whether they could change a check.
+    # The same rejected facts as evidence. They never pass or fail a check; the rules only use
+    # them to see whether a check's result could change.
     rejected: EvidenceBundle | None = None
 
 
-# -------------------------
-# Structured parsing + merge
-# -------------------------
+# Building the bundle
 
 
 def _fmt(number: float) -> str:
@@ -222,7 +223,11 @@ def _document(
 def _document_time(
     measured_at: str | None, doc: Document | None
 ) -> tuple[datetime | None, bool, str]:
-    """Explicit text date/time, else document date + text time of day, else document date."""
+    """When a reading in a document was taken.
+
+    Uses the date and time in the text if given, else the document's date plus the time from the
+    text, else just the document's date.
+    """
 
     explicit = parse_when(measured_at)
     if explicit:
@@ -354,7 +359,7 @@ _FACT_MODELS = {
 
 
 def _rejected_as_facts(record: dict[str, object]) -> PatientDocumentExtraction:
-    """One rejected record back as an extraction. A rejected plan phase brings back the whole plan."""
+    """Turn one rejected record back into facts. A rejected plan phase brings back the whole plan."""
 
     facts = empty_extraction()
     kind = str(record["kind"])
@@ -366,7 +371,7 @@ def _rejected_as_facts(record: dict[str, object]) -> PatientDocumentExtraction:
 
 
 def build_evidence(submission: PatientSubmission, extraction: ExtractionResult) -> EvidenceBundle:
-    """Merge structured fields and validated document facts, keeping provenance."""
+    """Combine structured fields and verified document facts, keeping where each one came from."""
 
     procedure = submission.procedure
     docs = {doc.doc_id: doc for doc in submission.documents if doc.doc_id}

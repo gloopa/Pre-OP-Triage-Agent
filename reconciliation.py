@@ -1,4 +1,4 @@
-"""Reconciliation: decide which evidence is the latest and current, without applying policy."""
+"""Work out which readings are the latest and which drugs are current. No policy rules here."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from typing import Literal
 from core import EvidenceItem
 from normalization import Lab, MedStatement, Vital
 
+
 def _interval(at: datetime | date | None, has_time: bool) -> tuple[datetime, datetime]:
-    """When a record could have happened: an instant, a whole day, or any time if undated."""
+    """The time range a record could fall in: an exact moment, a whole day, or any time if undated."""
 
     if at is None:
         return datetime.min, datetime.max
@@ -22,7 +23,7 @@ def _interval(at: datetime | date | None, has_time: bool) -> tuple[datetime, dat
 
 
 def _possible_latest(items: list, interval) -> list:
-    """Every item not definitely earlier than some other item. Usually a single item."""
+    """Items that could be the latest. Usually one; several when the dates are too vague to order."""
 
     spans = [interval(item) for item in items]
     return [
@@ -33,7 +34,7 @@ def _possible_latest(items: list, interval) -> list:
 
 
 def latest_vital_candidates(vitals: list[Vital], kind: Literal["BP", "TEMP"]) -> list[Vital]:
-    """Readings that could be the most recent. Several only when timestamps are unclear."""
+    """Readings of this kind that could be the latest."""
 
     readings = [v for v in vitals if v.kind == kind]
     return _possible_latest(readings, lambda v: _interval(v.at, v.has_time))
@@ -42,7 +43,7 @@ def latest_vital_candidates(vitals: list[Vital], kind: Literal["BP", "TEMP"]) ->
 def latest_lab_candidates(
     labs: list[Lab], test: Literal["CBC", "CMP"], on_or_before: date | None
 ) -> list[Lab]:
-    """Results that could be the most recent one on or before the procedure date."""
+    """Results that could be the latest one on or before the procedure date."""
 
     results = [
         lab for lab in labs
@@ -55,9 +56,10 @@ def latest_lab_candidates(
 class AnticoagulantStatus:
     canonical: str
     status: Literal["CURRENT", "STOPPED", "UNKNOWN"]
-    evidence: list[EvidenceItem]  # Deciding statements first, then older ones.
+    evidence: list[EvidenceItem]  # The statements that decided the status first, then older ones.
 
 
+# HISTORICAL counts as stopped; UNCERTAIN becomes UNKNOWN.
 _MED_STATUS = {
     "CURRENT": "CURRENT",
     "STOPPED": "STOPPED",
@@ -67,10 +69,10 @@ _MED_STATUS = {
 
 
 def anticoagulant_statuses(meds: list[MedStatement]) -> list[AnticoagulantStatus]:
-    """Status per anticoagulant: the latest dated statement wins over older and undated ones.
+    """Current status of each anticoagulant: the most recently dated statement wins.
 
-    Structured med-list entries carry no date, so any dated document statement overrides them.
-    PLANNED mentions are ignored. A drug that is never mentioned is simply absent.
+    Medication-list entries have no date, so any dated document statement overrides them.
+    PLANNED mentions are ignored. If the newest statements disagree, the status is UNKNOWN.
     """
 
     results: list[AnticoagulantStatus] = []

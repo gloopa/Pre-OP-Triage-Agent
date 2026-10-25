@@ -1,4 +1,4 @@
-"""Single structured LLM extraction over all patient documents, with quote validation."""
+"""Ask the LLM to pull facts out of the documents, then check every quote against the source text."""
 
 from __future__ import annotations
 
@@ -17,32 +17,30 @@ from core import Document, PatientSubmission
 
 @cache
 def _client() -> OpenAI:
-    """One reusable client per process; created lazily so imports work without an API key."""
+    """Created on first use, so this module can be imported without an API key."""
 
     return OpenAI(timeout=60.0, max_retries=2)
 
 
-# -------------------------
-# LLM output models
-# -------------------------
+# What the LLM returns. Every fact carries a quote so a person can check it against the document.
 
 
 class Evidence(BaseModel):
     doc_id: str
-    quote: str  # Exact substring of the identified document's text.
+    quote: str  # Must appear in that document's text; checked in validate_extraction.
 
 
 class BloodPressure(BaseModel):
     systolic: float
     diastolic: float
-    measured_at: str | None  # As stated in text: full date/time, or time of day only ("09:05").
+    measured_at: str | None  # As written: a full date and time, just a time ("09:05"), or None.
     evidence: Evidence
 
 
 class Temperature(BaseModel):
     value: float
     unit: Literal["C", "F"]
-    measured_at: str | None  # Same convention as BloodPressure.
+    measured_at: str | None  # Same format as BloodPressure.measured_at.
     evidence: Evidence
 
 
@@ -56,30 +54,31 @@ class SurgicalConsent(BaseModel):
     status: Literal["SIGNED", "UNSIGNED", "PENDING", "MISSING", "UNCERTAIN"]
     signer: Literal["PATIENT", "OTHER", "UNKNOWN"]
     signed_at: str | None
-    procedure: str | None  # As stated, for the reviewer.
-    matches_scheduled_procedure: bool | None  # Against the scheduled procedure; null -> UNKNOWN.
+    procedure: str | None  # As written on the consent; shown to the reviewer.
+    matches_scheduled_procedure: bool | None  # None means the text doesn't say; the rules treat it as unknown.
     evidence: Evidence
 
 
 class Medication(BaseModel):
-    name: str  # Preserve the name stated in the text.
-    # CURRENT includes a temporary perioperative hold; PLANNED = future/proposed only.
+    name: str  # As written (often a brand name); matched to a generic name in normalization.
+    # A temporary hold before surgery still counts as CURRENT. PLANNED means not started yet.
     status: Literal["CURRENT", "STOPPED", "HISTORICAL", "PLANNED", "UNCERTAIN"]
     as_of: str | None
     evidence: Evidence
 
 
 class PlanPhase(BaseModel):
-    """One phase of a plan. The model must choose a status, so a phase is never silently skipped."""
+    """One phase (before or after surgery) of an anticoagulation plan."""
 
-    # STATED: the text gives the instruction (quote it). DEFERRED: the text hands it to someone
-    # else or says it will be decided later (quote that). NOT_ADDRESSED: the text says nothing.
+    # The model must pick a status, so it can't skip a phase by leaving it empty.
+    # STATED: the instruction is given. DEFERRED: left to someone else or to later.
+    # NOT_ADDRESSED: not mentioned, so there is no evidence.
     status: Literal["STATED", "DEFERRED", "NOT_ADDRESSED"]
     evidence: Evidence | None
 
 
 class AnticoagulationPlan(BaseModel):
-    medication: str | None  # Matched to current anticoagulants via the Python alias map.
+    medication: str | None  # Matched to a known anticoagulant in normalization.ANTICOAGULANTS.
     before_surgery: PlanPhase
     after_surgery: PlanPhase
     evidence: Evidence
@@ -105,9 +104,7 @@ def empty_extraction() -> PatientDocumentExtraction:
     )
 
 
-# -------------------------
 # Prompt
-# -------------------------
 
 EXTRACTION_INSTRUCTIONS = """
 You extract facts from pre-operative clinical documents. Extract only; do not evaluate
@@ -170,13 +167,13 @@ Anticoagulation plans:
 
 
 def short_doc_ids(submission: PatientSubmission) -> dict[str, str | None]:
-    """Short prompt id ("D1", "D2", ...) -> real doc_id. Models miscopy long UUIDs."""
+    """Map short ids ("D1", "D2", ...) to real doc_ids. The model miscopies long ids, so the prompt uses these."""
 
     return {f"D{i}": doc.doc_id for i, doc in enumerate(submission.documents, start=1)}
 
 
 def build_prompt(submission: PatientSubmission) -> str:
-    """User input: the scheduled procedure plus every document (under its short id) with metadata."""
+    """The scheduled procedure plus every document, each labelled with its short id."""
 
     procedure_type = submission.procedure.procedure_type if submission.procedure else None
     payload = {
@@ -196,7 +193,7 @@ def build_prompt(submission: PatientSubmission) -> str:
 
 
 def _map_doc_ids(facts: PatientDocumentExtraction, ids: dict[str, str | None]) -> PatientDocumentExtraction:
-    """Replace short ids with real doc_ids. Anything else is left as is, so validation rejects it."""
+    """Swap short ids back to real doc_ids. Unknown ids are left as they are, so validation rejects them."""
 
     def mapped(evidence: Evidence | None) -> Evidence | None:
         if evidence is None or ids.get(evidence.doc_id) is None:
@@ -216,14 +213,16 @@ def _map_doc_ids(facts: PatientDocumentExtraction, ids: dict[str, str | None]) -
     return PatientDocumentExtraction(**kept)
 
 
-# -------------------------
-# Extraction + validation
-# -------------------------
+# Running the extraction and checking quotes
 
 
 @dataclass
 class ExtractionResult:
-    """Validated facts. When failed is True, facts is empty and means 'unknown', not 'absent'."""
+    """Facts that passed the quote check, plus the ones that didn't.
+
+    If failed is True the documents couldn't be read, so an empty fact list means "unknown",
+    not "nothing found".
+    """
 
     facts: PatientDocumentExtraction
     rejected: list[dict[str, object]] = field(default_factory=list)
@@ -231,24 +230,28 @@ class ExtractionResult:
     error: str | None = None
 
 
-# A degree sign before C/F, including the garbled form models emit for it ("\x17" + "6").
+# A degree sign before C or F, including the broken form the model sometimes writes instead
+# (a control character followed by "6"). Removed before comparing so it can't cause a mismatch.
 _DEGREE = re.compile(r"(?:[°º�]|[\x00-\x08\x0b\x0c\x0e-\x1f]6?)(?=\s*[CF]\b)")
+# The model may join separate parts of a document with a line break or "...".
 _PIECE_BREAK = re.compile(r"\n|\.\.\.|…")
 
 
 def _clean(text: str) -> str:
-    """Drop degree signs (real or garbled) and collapse whitespace; nothing else changes."""
+    """Remove degree signs and collapse whitespace, so formatting alone can't fail a match."""
 
     return re.sub(r"\s+", " ", _DEGREE.sub("", text)).strip()
 
 
 def quote_pieces(quote: str) -> list[str]:
-    """Split a quote at line breaks and ellipses into the pieces that must each match."""
+    """Split a quote into the parts that must each appear in the document."""
 
     return [piece for piece in (_clean(p) for p in _PIECE_BREAK.split(quote)) if piece]
 
 
 def _evidence_problem(evidence: Evidence, docs: dict[str, Document]) -> str | None:
+    """Why this evidence can't be trusted, or None if it checks out."""
+
     doc = docs.get(evidence.doc_id)
     if doc is None:
         return "unknown doc_id"
@@ -262,7 +265,7 @@ def _evidence_problem(evidence: Evidence, docs: dict[str, Document]) -> str | No
 def validate_extraction(
     facts: PatientDocumentExtraction, documents: list[Document]
 ) -> tuple[PatientDocumentExtraction, list[dict[str, object]]]:
-    """Drop facts whose evidence is not a verbatim quote from a real document."""
+    """Keep facts whose quotes appear in the named document; return the rest as rejected."""
 
     docs = {doc.doc_id: doc for doc in documents if doc.doc_id}
     rejected: list[dict[str, object]] = []
@@ -289,11 +292,11 @@ def validate_extraction(
                                 "kind": f"anticoagulation_plans.{phase}",
                                 "reason": phase_problem,
                                 "fact": phase_evidence.model_dump(),
-                                "plan": original.model_dump(),  # The plan as extracted, both phases.
+                                "plan": original.model_dump(),  # The whole plan as extracted, for the reviewer.
                             }
                         )
-                        # Keep the model's status but drop the unverified quote; an unquoted
-                        # STATED phase does not count as an instruction.
+                        # Keep the status but drop the unverified quote. A STATED phase with no
+                        # quote doesn't count as an instruction.
                         setattr(fact, phase, PlanPhase(status=getattr(fact, phase).status, evidence=None))
             kept[name].append(fact)
 
@@ -305,7 +308,7 @@ def _failure(error: str) -> ExtractionResult:
 
 
 def extract_documents(submission: PatientSubmission, *, model: str) -> ExtractionResult:
-    """One structured LLM request over all documents; failures are reported, never hidden."""
+    """Make one LLM call over all documents. Any failure comes back as a failed result, never hidden."""
 
     if not submission.documents:
         return ExtractionResult(facts=empty_extraction())

@@ -1,4 +1,4 @@
-"""Policy evaluators (one finding per subcheck) and deterministic decision routing."""
+"""Apply the four policy rules and turn the results into a decision. No LLM calls here."""
 
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ from reconciliation import anticoagulant_statuses, latest_lab_candidates, latest
 
 HP_WINDOW_DAYS = 30
 LAB_WINDOW_DAYS = {"LOW": 30, "MODERATE": 30, "HIGH": 14}
-SBP_LIMIT = 180  # Exclusion at >= this value.
-DBP_LIMIT = 110  # Exclusion at >= this value.
-TEMP_LIMIT_F = 100.4  # Exclusion above this value.
+SBP_LIMIT = 180  # Excluded at or above this value.
+DBP_LIMIT = 110  # Excluded at or above this value.
+TEMP_LIMIT_F = 100.4  # Excluded only above this value; 100.4 itself is fine.
 
 
 def _finding(
@@ -33,14 +33,14 @@ def _finding(
     evidence: list[EvidenceItem],
     fail_category: IssueCategory,
 ) -> Finding:
-    """UNKNOWN always maps to MISSING_REQUIRED_DATA; FAIL uses the rule's own category."""
+    """Build a finding. FAIL uses the rule's category; UNKNOWN always becomes MISSING_REQUIRED_DATA."""
 
     category = {"PASS": None, "FAIL": fail_category, "UNKNOWN": "MISSING_REQUIRED_DATA"}[status]
     return Finding(rule=rule, check=check, status=status, category=category, summary=summary, evidence=evidence)
 
 
 def _combine(outcomes: list[bool | None]) -> CheckStatus:
-    """All candidates pass -> PASS; all fail -> FAIL; mixed or undeterminable -> UNKNOWN."""
+    """Combine the possible latest readings: all pass is PASS, all fail is FAIL, anything else UNKNOWN."""
 
     if outcomes and all(o is True for o in outcomes):
         return "PASS"
@@ -54,6 +54,8 @@ def _days_before(procedure_date: date, at: date) -> int:
 
 
 def _in_window(procedure_date: date, at: date | None, window: int) -> bool | None:
+    """True if `at` is 0 to `window` days before the procedure; None if there is no date."""
+
     if at is None:
         return None
     return 0 <= _days_before(procedure_date, at) <= window
@@ -63,9 +65,7 @@ def _extraction_failed_summary(bundle: EvidenceBundle, what: str) -> str:
     return f"Documents could not be read ({bundle.extraction_error}), so {what} cannot be confirmed."
 
 
-# -------------------------
-# Rule 1: Required documentation
-# -------------------------
+# Rule 1: required documentation (H&P within 30 days, consent signed by the patient)
 
 
 def _evaluate_hp(bundle: EvidenceBundle) -> Finding:
@@ -140,9 +140,7 @@ def evaluate_documentation(bundle: EvidenceBundle) -> list[Finding]:
     return [_evaluate_hp(bundle), _evaluate_consent(bundle)]
 
 
-# -------------------------
-# Rule 2: Required testing
-# -------------------------
+# Rule 2: required tests (CBC, plus CMP for HIGH risk), using only the latest result of each
 
 
 def _evaluate_lab(bundle: EvidenceBundle, test: str, window: int) -> Finding:
@@ -179,13 +177,11 @@ def evaluate_testing(bundle: EvidenceBundle) -> list[Finding]:
     return [_evaluate_lab(bundle, test, window) for test in tests]
 
 
-# -------------------------
-# Rule 3: Anticoagulation management
-# -------------------------
+# Rule 3: anyone on an anticoagulant needs a plan covering before and after surgery
 
 
 def _plan_evidence(plans: list[PlanFact]) -> list[EvidenceItem]:
-    """Each plan's quotes, labelled by role in their value: plan, before/after surgery, deferred."""
+    """Every quote from these plans: the plan itself, each phase, and any deferred phases."""
 
     return [
         e for p in plans
@@ -213,7 +209,7 @@ def evaluate_anticoagulation(bundle: EvidenceBundle) -> list[Finding]:
         plans = [p for p in bundle.plans if p.canonical == drug.canonical]
         complete = [p for p in plans if p.before_surgery and p.after_surgery]
         if complete:
-            # Taking it: the plan covers it. Not taking it: no plan is needed. Either way, PASS.
+            # A complete plan passes even if it's unclear whether the patient still takes the drug.
             plan = complete[0]
             unclear = " (current use is unclear, but the rule is met either way)" if drug.status == "UNKNOWN" else ""
             findings.append(finding(check, "PASS", f"Perioperative plan for {drug.canonical} covers before "
@@ -246,9 +242,7 @@ def evaluate_anticoagulation(bundle: EvidenceBundle) -> list[Finding]:
     return findings
 
 
-# -------------------------
-# Rule 4: Acute safety exclusion
-# -------------------------
+# Rule 4: acute safety exclusions, using only the latest blood pressure and temperature
 
 
 def _bp_excluded(v: Vital) -> bool:
@@ -270,7 +264,8 @@ def _evaluate_vital(bundle: EvidenceBundle, kind: str) -> Finding:
 
     values = ", ".join(v.evidence.value or "?" for v in candidates)
     if bundle.extraction_failed:
-        # A later reading or recheck may be in the documents; keep the structured readings as evidence.
+        # The documents might hold a later reading or a recheck, so the result is unknown.
+        # The structured readings are still shown to the reviewer.
         latest_known = f" Latest structured {label}: {values}." if candidates else ""
         return finding("UNKNOWN", _extraction_failed_summary(bundle, f"the latest {label}") + latest_known)
     if not candidates:
@@ -288,16 +283,14 @@ def evaluate_safety(bundle: EvidenceBundle) -> list[Finding]:
     return [_evaluate_vital(bundle, "BP"), _evaluate_vital(bundle, "TEMP")]
 
 
-# -------------------------
-# Routing
-# -------------------------
+# Decision
 
 
 EVALUATORS = (evaluate_documentation, evaluate_testing, evaluate_anticoagulation, evaluate_safety)
 
 
 def _with_rejected(bundle: EvidenceBundle) -> EvidenceBundle:
-    """The bundle as it would be if every rejected fact were valid."""
+    """The bundle as if every rejected fact were true."""
 
     rejected = bundle.rejected
     return replace(
@@ -312,7 +305,7 @@ def _with_rejected(bundle: EvidenceBundle) -> EvidenceBundle:
 
 
 def _unverified(finding: Finding, alternative: Finding | None) -> Finding:
-    """UNKNOWN because an unverified (rejected) fact would change this check's outcome."""
+    """Mark a check UNKNOWN because a rejected fact would change its result."""
 
     if alternative is None:
         summary = f"{finding.summary} An unverified document fact would change this check; review it."
@@ -327,7 +320,7 @@ def _unverified(finding: Finding, alternative: Finding | None) -> Finding:
 
 
 def _compare(valid: list[Finding], alternative: list[Finding]) -> list[Finding]:
-    """Keep each check whose outcome rejected facts cannot change; otherwise UNKNOWN."""
+    """Keep checks the rejected facts can't change; mark the others UNKNOWN."""
 
     alt_by_check = {f.check: f for f in alternative}
     valid_checks = {f.check for f in valid}
@@ -338,7 +331,7 @@ def _compare(valid: list[Finding], alternative: list[Finding]) -> list[Finding]:
             findings.append(f)
         else:
             findings.append(_unverified(f, alt))
-    # Checks that only exist if rejected facts are true (e.g. an anticoagulant only they mention).
+    # Checks that exist only if the rejected facts are true, e.g. an anticoagulant only they mention.
     findings += [
         _finding(f.rule, f.check, "UNKNOWN", f"If the unverified document fact is correct: {f.summary} Review it.",
                  f.evidence, "MISSING_REQUIRED_DATA")
@@ -349,10 +342,10 @@ def _compare(valid: list[Finding], alternative: list[Finding]) -> list[Finding]:
 
 
 def evaluate_all(bundle: EvidenceBundle) -> list[Finding]:
-    """All four rules, always, in a fixed order.
+    """Run all four rules, always, in a fixed order.
 
-    Rejected facts never count as evidence, but a check whose outcome they would change is
-    UNKNOWN (with the rejected fact as evidence) rather than PASS/FAIL on the remaining evidence.
+    Rejected facts never count as evidence. But if one would change a check's result, that check
+    becomes UNKNOWN, so a nurse reviews it instead of trusting the result.
     """
 
     findings: list[Finding] = []
@@ -364,6 +357,8 @@ def evaluate_all(bundle: EvidenceBundle) -> list[Finding]:
 
 
 def _explanation(decision: Decision, findings: list[Finding], bundle: EvidenceBundle) -> str:
+    """A short summary built from the findings, so the same findings always give the same text."""
+
     exclusions = [f.summary for f in findings if f.rule == "SAFETY" and f.status == "FAIL"]
     follow_ups = [f.summary for f in findings if f.status != "PASS" and f.summary not in exclusions]
     if decision == "READY":
@@ -381,7 +376,7 @@ def _explanation(decision: Decision, findings: list[Finding], bundle: EvidenceBu
 
 
 def route(findings: list[Finding], bundle: EvidenceBundle) -> TriageOutput:
-    """Safety FAIL -> NOT_CLEARED; any other FAIL/UNKNOWN -> NEEDS_FOLLOW_UP; else READY."""
+    """NOT_CLEARED on any safety FAIL, NEEDS_FOLLOW_UP on any other FAIL or UNKNOWN, else READY."""
 
     if any(f.rule == "SAFETY" and f.status == "FAIL" for f in findings):
         decision: Decision = "NOT_CLEARED"
