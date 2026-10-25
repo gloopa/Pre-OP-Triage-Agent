@@ -1,6 +1,6 @@
 # Pre-Op Scheduling Triage
 
-**Ashwin Giritharan** · Cadence take-home exercise
+**Ashwin Giritharan**
 
 `triage_submission(submission, *, model)` in `core.py` returns a decision (`READY`, `NEEDS_FOLLOW_UP` or `NOT_CLEARED`), the issues blocking scheduling, and the evidence behind every check so a nurse can verify the result.
 
