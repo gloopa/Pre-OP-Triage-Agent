@@ -1,0 +1,76 @@
+{
+  "generated_at": "2026-10-25T00:39:10.562835+00:00",
+  "mode": "determinism",
+  "record_index": 0,
+  "case_id": "case_00000",
+  "model": "gpt-4.1-mini",
+  "runs": 10,
+  "decision_stability_pct": 100.0,
+  "json_format_stability_pct": 100.0,
+  "exact_output_match_pct": 20.0,
+  "decision_counts": {
+    "READY": 10
+  },
+  "run_rows": [
+    {
+      "run_index": 0,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 1,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 2,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 3,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 4,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 5,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 6,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 7,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 8,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    },
+    {
+      "run_index": 9,
+      "decision": "READY",
+      "json_schema_valid": true,
+      "error": null
+    }
+  ]
+}
